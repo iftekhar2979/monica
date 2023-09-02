@@ -8,6 +8,7 @@ use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
 
 class DeleteMultipleVCard implements ShouldQueue
 {
@@ -32,8 +33,26 @@ class DeleteMultipleVCard implements ShouldQueue
             return; // @codeCoverageIgnore
         }
 
+        Log::shareContext([
+            'addressbook_subscription_id' => $this->subscription->id,
+        ]);
+
+        try {
+            $this->run();
+        } finally {
+            Log::flushSharedContext();
+        }
+    }
+
+    /**
+     * Run the job.
+     */
+    private function run(): void
+    {
         $jobs = collect($this->hrefs)
-            ->map(fn (string $href): DeleteVCard => $this->deleteVCard($href));
+            ->map(fn (string $href): DeleteLocalVCard => $this->deleteVCard($href));
+
+        Log::channel('database')->info("Delete {$jobs->count()} card(s) from distant server...");
 
         $this->batch()->add($jobs);
     }
@@ -41,8 +60,8 @@ class DeleteMultipleVCard implements ShouldQueue
     /**
      * Delete the contact.
      */
-    private function deleteVCard(string $href): DeleteVCard
+    private function deleteVCard(string $href): DeleteLocalVCard
     {
-        return new DeleteVCard($this->subscription, $href);
+        return new DeleteLocalVCard($this->subscription, $href);
     }
 }

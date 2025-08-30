@@ -5,6 +5,9 @@ import basicSsl from '@vitejs/plugin-basic-ssl';
 import i18n from 'laravel-vue-i18n/vite';
 import tailwindcss from '@tailwindcss/vite';
 import { sentryVitePlugin } from '@sentry/vite-plugin';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current working directory.
@@ -45,4 +48,3 @@ export default defineConfig(({ mode }) => {
       sourcemap: env.VITE_PROD_SOURCE_MAPS,
     },
   };
-});

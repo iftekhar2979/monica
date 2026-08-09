@@ -3,6 +3,7 @@
 namespace App\Domains\Contact\ManageContact\Jobs;
 
 use App\Domains\Contact\ManageContact\Services\CreateContact;
+use App\Models\Contact;
 use App\Models\ImportJob;
 use Carbon\Carbon;
 use Exception;
@@ -11,6 +12,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 use Throwable;
@@ -50,7 +52,7 @@ class ImportContactsFromCsvJob implements ShouldQueue
                 return;
             }
 
-            // 2. Read CSV incrementally using stream handle
+            // 2. Read CSV incrementally using stream handle (memory safety)
             $handle = fopen($filePath, 'r');
             if (! $handle) {
                 $import->update([
@@ -114,7 +116,7 @@ class ImportContactsFromCsvJob implements ShouldQueue
                 ];
 
                 if (count($chunkBuffer) >= self::CHUNK_SIZE) {
-                    $this->processChunk(
+                    $this->processChunkInTransaction(
                         $chunkBuffer,
                         $normalizedHeaders,
                         $import,
@@ -128,9 +130,9 @@ class ImportContactsFromCsvJob implements ShouldQueue
                 }
             }
 
-            // Process any remaining rows in final chunk
+            // Process remaining rows in final chunk
             if (! empty($chunkBuffer)) {
-                $this->processChunk(
+                $this->processChunkInTransaction(
                     $chunkBuffer,
                     $normalizedHeaders,
                     $import,
@@ -176,9 +178,9 @@ class ImportContactsFromCsvJob implements ShouldQueue
     }
 
     /**
-     * Process a chunk of ~50 rows and update database counters after each chunk.
+     * Process a chunk of ~50 rows inside an atomic DB transaction to ensure retry safety.
      */
-    private function processChunk(
+    private function processChunkInTransaction(
         array $chunkBuffer,
         array $normalizedHeaders,
         ImportJob $import,
@@ -188,97 +190,129 @@ class ImportContactsFromCsvJob implements ShouldQueue
         int &$failedRows,
         array &$errors
     ): void {
-        foreach ($chunkBuffer as $item) {
-            $rowNumber = $item['row_number'];
-            $row = $item['data'];
-            $processedRows++;
+        DB::transaction(function () use (
+            $chunkBuffer,
+            $normalizedHeaders,
+            $import,
+            $vaultId,
+            &$processedRows,
+            &$successfulRows,
+            &$failedRows,
+            &$errors
+        ) {
+            foreach ($chunkBuffer as $item) {
+                $rowNumber = $item['row_number'];
+                $row = $item['data'];
+                $processedRows++;
 
-            // Skip completely empty rows
-            if (empty(array_filter($row))) {
-                continue;
+                // Skip completely empty rows
+                if (empty(array_filter($row))) {
+                    continue;
+                }
+
+                $rowLength = count($row);
+                $headerLength = count($normalizedHeaders);
+
+                if ($rowLength > $headerLength) {
+                    $row = array_slice($row, 0, $headerLength);
+                } elseif ($rowLength < $headerLength) {
+                    $row = array_pad($row, $headerLength, null);
+                }
+
+                $rowData = array_combine($normalizedHeaders, $row);
+
+                $firstName = trim($rowData['first_name'] ?? $rowData['firstname'] ?? $rowData['first name'] ?? '');
+                $lastName = trim($rowData['last_name'] ?? $rowData['lastname'] ?? $rowData['last name'] ?? '');
+                $middleName = trim($rowData['middle_name'] ?? $rowData['middlename'] ?? '');
+                $nickname = trim($rowData['nickname'] ?? '');
+                $maidenName = trim($rowData['maiden_name'] ?? $rowData['maidenname'] ?? '');
+                $prefix = trim($rowData['prefix'] ?? '');
+                $suffix = trim($rowData['suffix'] ?? '');
+                $email = trim($rowData['email'] ?? $rowData['email_address'] ?? $rowData['email address'] ?? '');
+
+                // Validation Rule 1: Missing required name (at least first_name, last_name, or nickname)
+                if (empty($firstName) && empty($lastName) && empty($nickname)) {
+                    $failedRows++;
+                    $errors[] = [
+                        'row' => $rowNumber,
+                        'errors' => ['Missing required name: At least one of first_name, last_name, or nickname is required.'],
+                    ];
+
+                    continue;
+                }
+
+                // Validation Rule 2: Invalid email format
+                if (! empty($email) && ! filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    $failedRows++;
+                    $errors[] = [
+                        'row' => $rowNumber,
+                        'errors' => ["Invalid email format: '{$email}' is not a valid email address."],
+                    ];
+
+                    continue;
+                }
+
+                // Idempotency check: prevent duplicate contact creation on job retries
+                $existingContact = Contact::where('vault_id', $vaultId)
+                    ->where(function ($query) use ($firstName, $lastName, $nickname) {
+                        if (! empty($firstName)) {
+                            $query->where('first_name', $firstName);
+                        }
+                        if (! empty($lastName)) {
+                            $query->where('last_name', $lastName);
+                        }
+                        if (! empty($nickname)) {
+                            $query->where('nickname', $nickname);
+                        }
+                    })
+                    ->first();
+
+                if ($existingContact) {
+                    // Already created in a prior run/attempt, skip duplicate creation
+                    $successfulRows++;
+                    continue;
+                }
+
+                try {
+                    $serviceData = [
+                        'account_id' => $import->account_id,
+                        'author_id' => $import->user_id,
+                        'vault_id' => $vaultId,
+                        'first_name' => $firstName ?: null,
+                        'last_name' => $lastName ?: null,
+                        'middle_name' => $middleName ?: null,
+                        'nickname' => $nickname ?: null,
+                        'maiden_name' => $maidenName ?: null,
+                        'prefix' => $prefix ?: null,
+                        'suffix' => $suffix ?: null,
+                        'listed' => true,
+                    ];
+
+                    // Create contact using Monica's existing CreateContact service
+                    (new CreateContact)->execute($serviceData);
+                    $successfulRows++;
+                } catch (ValidationException $e) {
+                    $failedRows++;
+                    $errors[] = [
+                        'row' => $rowNumber,
+                        'errors' => array_merge(...array_values($e->errors())),
+                    ];
+                } catch (Exception $e) {
+                    $failedRows++;
+                    $errors[] = [
+                        'row' => $rowNumber,
+                        'errors' => [$e->getMessage()],
+                    ];
+                }
             }
 
-            $rowLength = count($row);
-            $headerLength = count($normalizedHeaders);
-
-            if ($rowLength > $headerLength) {
-                $row = array_slice($row, 0, $headerLength);
-            } elseif ($rowLength < $headerLength) {
-                $row = array_pad($row, $headerLength, null);
-            }
-
-            $rowData = array_combine($normalizedHeaders, $row);
-
-            $firstName = trim($rowData['first_name'] ?? $rowData['firstname'] ?? $rowData['first name'] ?? '');
-            $lastName = trim($rowData['last_name'] ?? $rowData['lastname'] ?? $rowData['last name'] ?? '');
-            $middleName = trim($rowData['middle_name'] ?? $rowData['middlename'] ?? '');
-            $nickname = trim($rowData['nickname'] ?? '');
-            $maidenName = trim($rowData['maiden_name'] ?? $rowData['maidenname'] ?? '');
-            $prefix = trim($rowData['prefix'] ?? '');
-            $suffix = trim($rowData['suffix'] ?? '');
-            $email = trim($rowData['email'] ?? $rowData['email_address'] ?? $rowData['email address'] ?? '');
-
-            // Validation Rule 1: Missing required name (at least first_name, last_name, or nickname)
-            if (empty($firstName) && empty($lastName) && empty($nickname)) {
-                $failedRows++;
-                $errors[] = [
-                    'row' => $rowNumber,
-                    'errors' => ['Missing required name: At least one of first_name, last_name, or nickname is required.'],
-                ];
-
-                continue;
-            }
-
-            // Validation Rule 2: Invalid email format
-            if (! empty($email) && ! filter_var($email, FILTER_VALIDATE_EMAIL)) {
-                $failedRows++;
-                $errors[] = [
-                    'row' => $rowNumber,
-                    'errors' => ["Invalid email format: '{$email}' is not a valid email address."],
-                ];
-
-                continue;
-            }
-
-            try {
-                $serviceData = [
-                    'account_id' => $import->account_id,
-                    'author_id' => $import->user_id,
-                    'vault_id' => $vaultId,
-                    'first_name' => $firstName ?: null,
-                    'last_name' => $lastName ?: null,
-                    'middle_name' => $middleName ?: null,
-                    'nickname' => $nickname ?: null,
-                    'maiden_name' => $maidenName ?: null,
-                    'prefix' => $prefix ?: null,
-                    'suffix' => $suffix ?: null,
-                    'listed' => true,
-                ];
-
-                // Create contact through Monica's existing CreateContact service
-                (new CreateContact)->execute($serviceData);
-                $successfulRows++;
-            } catch (ValidationException $e) {
-                $failedRows++;
-                $errors[] = [
-                    'row' => $rowNumber,
-                    'errors' => array_merge(...array_values($e->errors())),
-                ];
-            } catch (Exception $e) {
-                $failedRows++;
-                $errors[] = [
-                    'row' => $rowNumber,
-                    'errors' => [$e->getMessage()],
-                ];
-            }
-        }
-
-        // Update database progress after each chunk
-        $import->update([
-            'processed_rows' => $processedRows,
-            'successful_rows' => $successfulRows,
-            'failed_rows' => $failedRows,
-            'errors' => $errors,
-        ]);
+            // Update database progress atomically within the chunk transaction
+            $import->update([
+                'processed_rows' => $processedRows,
+                'successful_rows' => $successfulRows,
+                'failed_rows' => $failedRows,
+                'errors' => $errors,
+            ]);
+        });
     }
 }

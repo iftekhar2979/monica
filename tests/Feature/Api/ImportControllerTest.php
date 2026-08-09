@@ -7,6 +7,7 @@ use App\Models\Account;
 use App\Models\ImportJob;
 use App\Models\User;
 use App\Models\Vault;
+use Carbon\Carbon;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Queue;
@@ -96,5 +97,72 @@ class ImportControllerTest extends TestCase
         Queue::assertPushed(ImportContactsFromCsvJob::class, function ($job) use ($importId) {
             return $job->import->id === $importId;
         });
+    }
+
+    public function test_show_endpoint_returns_import_progress(): void
+    {
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+        $vault = Vault::factory()->create(['account_id' => $account->id]);
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'vault_id' => $vault->id,
+            'filename' => 'contacts.csv',
+            'file_path' => 'imports/contacts.csv',
+            'status' => ImportJob::STATUS_PROCESSING,
+            'total_rows' => 500,
+            'processed_rows' => 320,
+            'successful_rows' => 318,
+            'failed_rows' => 2,
+            'started_at' => Carbon::now()->subMinutes(2),
+        ]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $response = $this->getJson("/api/import/{$import->id}");
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'data' => [
+                    'id' => $import->id,
+                    'filename' => 'contacts.csv',
+                    'total_rows' => 500,
+                    'processed_rows' => 320,
+                    'failed_rows' => 2,
+                    'status' => 'processing',
+                    'progress_pct' => 64,
+                    'completed_at' => null,
+                ],
+            ]);
+    }
+
+    public function test_show_endpoint_enforces_account_ownership(): void
+    {
+        $account1 = Account::factory()->create();
+        $user1 = User::factory()->create(['account_id' => $account1->id]);
+
+        $account2 = Account::factory()->create();
+        $user2 = User::factory()->create(['account_id' => $account2->id]);
+
+        $import = ImportJob::create([
+            'account_id' => $account1->id,
+            'user_id' => $user1->id,
+            'filename' => 'contacts.csv',
+            'file_path' => 'imports/contacts.csv',
+            'status' => ImportJob::STATUS_PENDING,
+            'total_rows' => 100,
+            'processed_rows' => 0,
+            'successful_rows' => 0,
+            'failed_rows' => 0,
+        ]);
+
+        // Acting as user from account 2 trying to access account 1's import
+        Sanctum::actingAs($user2, ['*']);
+
+        $response = $this->getJson("/api/import/{$import->id}");
+
+        $response->assertStatus(404);
     }
 }

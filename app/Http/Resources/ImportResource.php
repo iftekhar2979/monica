@@ -2,6 +2,7 @@
 
 namespace App\Http\Resources;
 
+use App\Models\ImportJob;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
@@ -14,22 +15,23 @@ class ImportResource extends JsonResource
      */
     public function toArray(Request $request): array
     {
+        $progressPct = 0;
+        if ($this->total_rows > 0) {
+            $progressPct = (int) min(100, floor(($this->processed_rows / $this->total_rows) * 100));
+        } elseif ($this->status === ImportJob::STATUS_COMPLETED) {
+            $progressPct = 100;
+        }
+
         return [
             'id' => (int) $this->id,
-            'account_id' => $this->account_id,
-            'user_id' => $this->user_id,
             'filename' => $this->filename,
-            'file_path' => $this->file_path,
             'total_rows' => (int) $this->total_rows,
             'processed_rows' => (int) $this->processed_rows,
             'failed_rows' => (int) $this->failed_rows,
-            'successful_rows' => (int) $this->successful_rows,
             'status' => $this->status,
-            'failure_message' => $this->failure_message,
-            'errors' => $this->errors,
+            'progress_pct' => $progressPct,
             'started_at' => $this->started_at?->toISOString(),
             'completed_at' => $this->completed_at?->toISOString(),
-            'created_at' => $this->created_at?->toISOString(),
         ];
     }
 }

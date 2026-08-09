@@ -56,4 +56,19 @@ class ImportController extends ApiController
             ->response()
             ->setStatusCode(201);
     }
+
+    /**
+     * Return the current import status and progress.
+     */
+    #[ResponseFromApiResource(ImportResource::class, ImportJob::class, status: 200)]
+    public function show(Request $request, string $id)
+    {
+        $user = $request->user();
+
+        // Enforce authentication & account ownership
+        $importJob = ImportJob::where('account_id', $user->account_id)
+            ->findOrFail($id);
+
+        return new ImportResource($importJob);
+    }
 }

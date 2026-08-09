@@ -8,6 +8,7 @@ use App\Http\Resources\ImportResource;
 use App\Models\ImportJob;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
 use Knuckles\Scribe\Attributes\{BodyParam, ResponseFromApiResource};
 
 /**
@@ -98,5 +99,76 @@ class ImportController extends ApiController
         ]);
 
         return new ImportResource($importJob);
+    }
+
+    /**
+     * Download a CSV file containing rejected rows and their error details.
+     */
+    public function downloadFailedRows(Request $request, string $id)
+    {
+        $user = $request->user();
+
+        // Enforce account ownership
+        $importJob = ImportJob::where('account_id', $user->account_id)
+            ->findOrFail($id);
+
+        if (empty($importJob->errors) || $importJob->failed_rows === 0) {
+            return response()->json([
+                'message' => 'No failed rows exist for this import job.',
+            ], 404);
+        }
+
+        $filePath = Storage::path($importJob->file_path);
+        if (! file_exists($filePath)) {
+            return response()->json([
+                'message' => 'Original uploaded file is no longer available.',
+            ], 404);
+        }
+
+        // Map row number -> error message string
+        $errorMap = [];
+        foreach ($importJob->errors as $errorItem) {
+            $rowNum = $errorItem['row'] ?? null;
+            $errList = $errorItem['errors'] ?? [];
+            if ($rowNum) {
+                $errorMap[$rowNum] = is_array($errList) ? implode('; ', $errList) : (string) $errList;
+            }
+        }
+
+        $downloadFilename = 'failed_rows_import_' . $importJob->id . '.csv';
+
+        return response()->streamDownload(function () use ($filePath, $errorMap) {
+            $handle = fopen($filePath, 'r');
+            if (! $handle) {
+                return;
+            }
+
+            $output = fopen('php://output', 'w');
+
+            // Header row
+            $originalHeaders = fgetcsv($handle);
+            if ($originalHeaders) {
+                $newHeaders = array_merge(['row_number', 'error_reason'], $originalHeaders);
+                fputcsv($output, $newHeaders);
+            }
+
+            $currentRowNumber = 1; // Header is row 1
+            while (($row = fgetcsv($handle)) !== false) {
+                $currentRowNumber++;
+                if (isset($errorMap[$currentRowNumber])) {
+                    $failedRowData = array_merge(
+                        [$currentRowNumber, $errorMap[$currentRowNumber]],
+                        $row
+                    );
+                    fputcsv($output, $failedRowData);
+                }
+            }
+
+            fclose($handle);
+            fclose($output);
+        }, $downloadFilename, [
+            'Content-Type' => 'text/csv',
+            'Content-Disposition' => "attachment; filename=\"{$downloadFilename}\"",
+        ]);
     }
 }

@@ -201,4 +201,47 @@ class ImportControllerTest extends TestCase
             'failure_message' => 'Import was cancelled by user.',
         ]);
     }
+
+    public function test_download_failed_rows_returns_csv_of_rejected_rows(): void
+    {
+        Storage::fake('local');
+
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+
+        $csvContent = "first_name,last_name,email\nValid,User,valid@example.com\n,,invalid-email";
+        $filePath = 'imports/test_failed_download.csv';
+        Storage::put($filePath, $csvContent);
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'filename' => 'test_failed_download.csv',
+            'file_path' => $filePath,
+            'status' => ImportJob::STATUS_COMPLETED,
+            'total_rows' => 2,
+            'processed_rows' => 2,
+            'successful_rows' => 1,
+            'failed_rows' => 1,
+            'errors' => [
+                [
+                    'row' => 3,
+                    'errors' => ['Missing required name: At least one of first_name, last_name, or nickname is required.'],
+                ],
+            ],
+        ]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $response = $this->getJson("/api/import/{$import->id}/failed-rows");
+
+        $response->assertStatus(200)
+            ->assertHeader('Content-Type', 'text/csv; charset=UTF-8');
+
+        $content = $response->streamedContent();
+
+        $this->assertStringContainsString('row_number,error_reason,first_name,last_name,email', $content);
+        $this->assertStringContainsString('3,Missing required name', $content);
+        $this->assertStringContainsString('invalid-email', $content);
+    }
 }

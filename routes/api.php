@@ -29,4 +29,5 @@ Route::middleware('auth:sanctum')->name('api.')->group(function () {
     Route::get('import/{id}', [ImportController::class, 'show'])->name('import.show');
     Route::post('import/{id}/cancel', [ImportController::class, 'cancel'])->name('import.cancel');
     Route::delete('import/{id}', [ImportController::class, 'cancel'])->name('import.delete');
+    Route::get('import/{id}/failed-rows', [ImportController::class, 'downloadFailedRows'])->name('import.failed-rows');
 });

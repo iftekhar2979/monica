@@ -1,0 +1,100 @@
+<?php
+
+namespace Tests\Feature\Api;
+
+use App\Domains\Contact\ManageContact\Jobs\ImportContactsFromCsvJob;
+use App\Models\Account;
+use App\Models\ImportJob;
+use App\Models\User;
+use App\Models\Vault;
+use Illuminate\Foundation\Testing\DatabaseTransactions;
+use Illuminate\Http\UploadedFile;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Facades\Storage;
+use Laravel\Sanctum\Sanctum;
+use Tests\TestCase;
+
+class ImportControllerTest extends TestCase
+{
+    use DatabaseTransactions;
+
+    public function test_import_endpoint_requires_authentication(): void
+    {
+        $response = $this->postJson('/api/import');
+
+        $response->assertStatus(401);
+    }
+
+    public function test_import_endpoint_validates_file_upload(): void
+    {
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $response = $this->postJson('/api/import', []);
+
+        $response->assertStatus(422)
+            ->assertJsonValidationErrors(['file']);
+    }
+
+    public function test_import_initiation_creates_pending_record_and_dispatches_job(): void
+    {
+        Queue::fake();
+        Storage::fake('local');
+
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+        $vault = Vault::factory()->create(['account_id' => $account->id]);
+        $user->vaults()->attach($vault->id, ['permission' => 1]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $csvContent = "first_name,last_name\nJohn,Doe\nJane,Smith";
+        $file = UploadedFile::fake()->createWithContent('contacts.csv', $csvContent);
+
+        $response = $this->postJson('/api/import', [
+            'file' => $file,
+            'vault_id' => $vault->id,
+        ]);
+
+        $response->assertStatus(201)
+            ->assertJsonStructure([
+                'data' => [
+                    'id',
+                    'filename',
+                    'total_rows',
+                    'processed_rows',
+                    'failed_rows',
+                    'status',
+                    'created_at',
+                ],
+            ])
+            ->assertJson([
+                'data' => [
+                    'filename' => 'contacts.csv',
+                    'total_rows' => 0,
+                    'processed_rows' => 0,
+                    'failed_rows' => 0,
+                    'status' => 'pending',
+                ],
+            ]);
+
+        $importId = $response->json('data.id');
+
+        $this->assertDatabaseHas('import_jobs', [
+            'id' => $importId,
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'filename' => 'contacts.csv',
+            'status' => ImportJob::STATUS_PENDING,
+            'total_rows' => 0,
+            'processed_rows' => 0,
+            'failed_rows' => 0,
+        ]);
+
+        Queue::assertPushed(ImportContactsFromCsvJob::class, function ($job) use ($importId) {
+            return $job->import->id === $importId;
+        });
+    }
+}

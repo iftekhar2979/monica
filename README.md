@@ -177,8 +177,37 @@ We are also fortunate to have an amazing [community of developers](https://githu
 
 Monica makes use of numerous open-source projects and we are deeply grateful. We hope that by offering Monica as a free, open-source project, we can help others in the same way these programs have helped us.
 
+## Asynchronous CSV Import Architecture
+
+### 1. How the Import Flow Works
+* **Initiation (`POST /api/import`)**: An authenticated user uploads a CSV file. The controller validates the file type, saves the file in non-public storage (`storage/app/imports`), creates a `contact_imports` database tracking record with status `pending`, and dispatches the `ImportContactsFromCsvJob` to the background queue.
+* **Instant HTTP Response**: The HTTP endpoint immediately returns a `201 Created` JSON payload with the initial import state (`status: "pending"`, `total_rows: 0`, `processed_rows: 0`, `failed_rows: 0`) without processing contacts in the request lifecycle.
+* **Background Queue Processing**: The `ImportContactsFromCsvJob` runs in the background. It reads the CSV line-by-line using `fgetcsv()` (minimizing memory overhead), updates progress counters in real time, and executes `CreateContact` for each row.
+* **Fault Tolerance**: Each row is evaluated within an isolated `try/catch` block. If a row is malformed or fails validation, error details and row numbers are logged to the `errors` array, `failed_rows` is incremented, and processing continues for remaining rows without failing the batch.
+
+### 2. Components Reused or Modified
+* **`App\Domains\Contact\ManageContact\Services\CreateContact`** (Reused): Used directly to validate contact attributes, enforce domain rules, insert `contacts` records, and generate `ContactFeedItem` feed entries.
+* **`App\Http\Controllers\ApiController`** (Reused): Extended by `ImportController` to inherit Sanctum authentication middleware, query error handlers, and standard JSON responses.
+* **`routes/api.php`** (Modified): Registered `POST /api/import` under the `auth:sanctum` middleware group.
+* **`App\Models\Account`, `User`, `Vault`** (Reused): Referenced for authorization, ownership verification, and default vault resolution.
+
+### 3. Important Assumptions Made
+* **Background Queue Worker**: Assumed a queue listener (e.g. `php artisan queue:work` or Sail `laravel.queue` container) is active to execute queued jobs.
+* **CSV Structure & Headers**: Assumed CSV files include a header row. Column headers are normalized and case-insensitive (supports `first_name`/`firstname`/`First Name`, `last_name`/`lastname`, `middle_name`, `nickname`, `maiden_name`, `prefix`, `suffix`).
+* **Minimum Contact Requirements**: Assumed at least one name identifier (`first_name`, `last_name`, or `nickname`) must be present for a valid row. Rows missing all name fields or breaking domain rules log an error and continue.
+### 4. Data Model Design Decisions (`import_jobs` Table)
+* **Table & Model Naming (`import_jobs` / `ImportJob`)**: Created `import_jobs` table and `App\Models\ImportJob` model to follow Monica's standard Laravel table naming conventions.
+* **Account & User Scoping (`account_id`, `user_id`)**: Includes `account_id` foreign key for strict multi-tenant account isolation, `user_id` to track the initiating user, and `vault_id` for target vault scoping.
+* **Dual Error Tracking (`failure_message` & `errors`)**:
+  * **`failure_message`** (text, nullable): Records high-level system failures (e.g. unreadable file, empty file stream, catastrophic job error).
+  * **`errors`** (JSON, nullable): Stores line-by-line validation/execution failures (`[ { "row": 3, "errors": [...] } ]`) so users can inspect exact row errors.
+* **Progress Counters (`total_rows`, `processed_rows`, `successful_rows`, `failed_rows`)**: Stores real-time integers for progress monitoring and progress bar percentages.
+* **Timestamps (`started_at`, `completed_at`)**: Tracks execution start time and completion duration alongside standard `created_at` and `updated_at` fields.
+
 ## License
 
 Copyright © 2016–2023
 
 Licensed under [the AGPL License](/LICENSE.md).
+
+

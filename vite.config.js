@@ -30,7 +30,6 @@ export default defineConfig(({ mode }) => {
       }),
       tailwindcss(),
       i18n(),
-      basicSsl(),
       sentryVitePlugin({
         disable: !env.SENTRY_ORG || !env.SENTRY_PROJECT,
         org: env.SENTRY_ORG,
@@ -38,8 +37,10 @@ export default defineConfig(({ mode }) => {
       }),
     ],
     server: {
-      https: true,
-      host: 'localhost',
+      host: '0.0.0.0',
+      hmr: {
+        host: 'localhost',
+      },
     },
     ssr: {
       noExternal: ['@inertiajs/server'],
@@ -48,3 +49,4 @@ export default defineConfig(({ mode }) => {
       sourcemap: env.VITE_PROD_SOURCE_MAPS,
     },
   };
+});

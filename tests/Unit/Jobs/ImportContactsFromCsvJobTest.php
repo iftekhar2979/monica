@@ -4,6 +4,7 @@ namespace Tests\Unit\Jobs;
 
 use App\Domains\Contact\ManageContact\Jobs\ImportContactsFromCsvJob;
 use App\Models\Account;
+use App\Models\Contact;
 use App\Models\ImportJob;
 use App\Models\User;
 use App\Models\Vault;
@@ -114,5 +115,52 @@ class ImportContactsFromCsvJobTest extends TestCase
         $this->assertEquals(0, $import->successful_rows);
         $this->assertEquals(2, $import->failed_rows);
         $this->assertStringContainsString('No contacts were imported successfully', $import->failure_message);
+    }
+
+    public function test_job_retry_is_idempotent_and_does_not_create_duplicate_contacts(): void
+    {
+        Storage::fake('local');
+
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+        $vault = Vault::factory()->create(['account_id' => $account->id]);
+        $user->vaults()->attach($vault->id, ['permission' => 1]);
+
+        $csvLines = [
+            "first_name,last_name",
+            "David,Miller",
+            "Eva,Green",
+        ];
+
+        $filePath = 'imports/retry_test.csv';
+        Storage::put($filePath, implode("\n", $csvLines));
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'vault_id' => $vault->id,
+            'filename' => 'retry_test.csv',
+            'file_path' => $filePath,
+            'status' => ImportJob::STATUS_PENDING,
+            'total_rows' => 0,
+            'processed_rows' => 0,
+            'successful_rows' => 0,
+            'failed_rows' => 0,
+        ]);
+
+        // First attempt / execution of job
+        $job1 = new ImportContactsFromCsvJob($import);
+        $job1->handle();
+
+        $initialContactCount = Contact::where('vault_id', $vault->id)->count();
+        $this->assertEquals(2, $initialContactCount);
+
+        // Simulate Laravel queue retry after timeout/worker restart
+        $job2 = new ImportContactsFromCsvJob($import);
+        $job2->handle();
+
+        // Assert that retry did NOT create duplicate contacts
+        $retryContactCount = Contact::where('vault_id', $vault->id)->count();
+        $this->assertEquals(2, $retryContactCount);
     }
 }

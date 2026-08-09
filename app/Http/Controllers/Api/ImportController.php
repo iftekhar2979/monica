@@ -6,6 +6,7 @@ use App\Domains\Contact\ManageContact\Jobs\ImportContactsFromCsvJob;
 use App\Http\Controllers\ApiController;
 use App\Http\Resources\ImportResource;
 use App\Models\ImportJob;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Knuckles\Scribe\Attributes\{BodyParam, ResponseFromApiResource};
 
@@ -68,6 +69,33 @@ class ImportController extends ApiController
         // Enforce authentication & account ownership
         $importJob = ImportJob::where('account_id', $user->account_id)
             ->findOrFail($id);
+
+        return new ImportResource($importJob);
+    }
+
+    /**
+     * Cancel an active or pending CSV import job.
+     */
+    #[ResponseFromApiResource(ImportResource::class, ImportJob::class, status: 200)]
+    public function cancel(Request $request, string $id)
+    {
+        $user = $request->user();
+
+        // Enforce account ownership
+        $importJob = ImportJob::where('account_id', $user->account_id)
+            ->findOrFail($id);
+
+        if (in_array($importJob->status, [ImportJob::STATUS_COMPLETED, ImportJob::STATUS_FAILED, ImportJob::STATUS_CANCELLED])) {
+            return response()->json([
+                'message' => "Cannot cancel an import that has already reached state '{$importJob->status}'.",
+            ], 422);
+        }
+
+        $importJob->update([
+            'status' => ImportJob::STATUS_CANCELLED,
+            'failure_message' => 'Import was cancelled by user.',
+            'completed_at' => Carbon::now(),
+        ]);
 
         return new ImportResource($importJob);
     }

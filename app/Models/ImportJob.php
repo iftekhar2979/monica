@@ -16,6 +16,7 @@ class ImportJob extends Model
     public const STATUS_PROCESSING = 'processing';
     public const STATUS_COMPLETED = 'completed';
     public const STATUS_FAILED = 'failed';
+    public const STATUS_CANCELLED = 'cancelled';
 
     protected $fillable = [
         'account_id',

@@ -2,6 +2,9 @@ import js from '@eslint/js';
 import globals from 'globals';
 import pluginVue from 'eslint-plugin-vue';
 import eslintConfigPrettier from 'eslint-config-prettier';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 export default [
   js.configs.recommended,
@@ -64,4 +67,3 @@ export default [
     },
   },
   eslintConfigPrettier,
-];

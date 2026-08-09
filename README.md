@@ -177,18 +177,129 @@ We are also fortunate to have an amazing [community of developers](https://githu
 
 Monica makes use of numerous open-source projects and we are deeply grateful. We hope that by offering Monica as a free, open-source project, we can help others in the same way these programs have helped us.
 
-## Asynchronous CSV Import Architecture
+## Asynchronous CSV Import Architecture & Setup
 
-For full implementation details, see [TASK_DOCUMENTATION.md](file:///d:/pswrk/monica/TASK_DOCUMENTATION.md).
+This repository features a complete redesign of Monica's CSV contact import system, migrating it from synchronous HTTP request processing to a high-performance, fault-tolerant asynchronous background pipeline with real-time progress tracking, per-row error isolation, retry safety, and import cancellation.
 
-### Automated Testing Instructions
-All automated tests covering Import Initiation, Progress Tracking, Per-Row Error Isolation, and Retry Safety can be executed via a single command:
+---
 
+### 1. Setup Instructions
+
+#### Environment Configuration (Docker Sail / WSL 2)
+1. **Clone & Configure Environment**:
+   ```bash
+   cp .env.example .env
+   ```
+2. **Configure Ports** in `.env` to prevent host collisions:
+   ```ini
+   APP_PORT=8080
+   VITE_PORT=5174
+   FORWARD_REDIS_PORT=6380
+   FORWARD_DB_PORT=3307
+   ```
+3. **Start Docker Sail Containers**:
+   ```bash
+   ./vendor/bin/sail up -d
+   ```
+4. **Run Database Migrations**:
+   ```bash
+   ./vendor/bin/sail artisan migrate
+   ```
+5. **Start Background Queue Worker**:
+   ```bash
+   ./vendor/bin/sail artisan queue:work
+   ```
+   *Note: In local testing, `QUEUE_CONNECTION=sync` processes jobs in synchronous inline mode.*
+
+---
+
+### 2. Existing-Flow Analysis
+
+#### Original Synchronous Flow
+Previously, Monica processed imported CSV files synchronously inside the HTTP controller request lifecycle:
+- **Bottlenecks**: Uploading and parsing large CSV files (e.g. 5,000+ rows) caused PHP script execution timeouts, exceeded memory limits (`Fatal error: Allowed memory size exhausted`), and blocked Nginx/PHP-FPM worker threads.
+- **Single Point of Failure**: A single malformed row or database validation failure threw an unhandled exception that aborted the entire HTTP request, leaving no contacts imported and providing no feedback on which row failed.
+- **Lack of Visibility**: Users had zero visibility into import execution progress, total rows handled, or line-by-line validation errors.
+
+#### Components Reused & Modified
+- **`App\Domains\Contact\ManageContact\Services\CreateContact`** (Reused): Reused directly to handle contact attribute validation, domain rule enforcement, database insertion, and `ContactFeedItem` feed entry generation.
+- **`App\Http\Controllers\ApiController`** (Reused): Extended by `ImportController` to inherit Sanctum authentication, query error handling, and standard JSON response formatting.
+- **`routes/api.php`** (Modified): Registered `/api/import` endpoints under `auth:sanctum` middleware.
+
+---
+
+### 3. Implementation Approach
+
+#### Architecture Highlights
+1. **Instant Asynchronous Response (`POST /api/import`)**:
+   Validates the uploaded file, saves it to non-public storage (`storage/app/imports`), creates an `import_jobs` tracking record in `pending` status, dispatches `ImportContactsFromCsvJob` to the background queue, and returns an immediate `201 Created` HTTP response.
+2. **Incremental CSV Streaming & 50-Row Chunking**:
+   Reads the CSV file line-by-line using `fopen()` / `fgetcsv()` stream pointers without loading the full file into memory. Processes contacts in buffered chunks of 50 rows (`CHUNK_SIZE = 50`).
+3. **Real-Time Progress Tracking (`GET /api/import/{id}`)**:
+   Calculates progress percentage (`progress_pct`) dynamically from `processed_rows` and `total_rows` stored on the `import_jobs` table without querying the `contacts` table.
+4. **Per-Row Error Isolation**:
+   Evaluates each row inside an isolated `try/catch` block. Malformed rows increment `failed_rows` and record error details (`{"row": N, "errors": [...]}`) in the `errors` JSON column while remaining rows continue importing.
+5. **In-Flight Import Cancellation (`POST /api/import/{id}/cancel` & `DELETE /api/import/{id}`)**:
+   Allows users to cancel an active or pending import. The API transitions the job status to `cancelled`, and the background job checks status before each chunk and aborts processing cleanly.
+6. **Downloadable Rejected Rows CSV (`GET /api/import/{id}/failed-rows`)**:
+   Streams a generated CSV file (`failed_rows_import_{id}.csv`) containing rejected rows prepended with `row_number` and `error_reason` columns.
+
+---
+
+### 4. Assumptions and Limitations
+
+- **Background Worker**: Assumes a queue listener (e.g. `php artisan queue:work`) is running in production.
+- **CSV Headers**: Assumes CSV files include a header row. Column headers are normalized and case-insensitive (`first_name`/`firstname`, `last_name`, `email`, `nickname`, etc.).
+- **Minimum Identifier**: Requires at least one name field (`first_name`, `last_name`, or `nickname`) for a valid row.
+- **File Storage**: Storage path defaults to non-public `storage/app/imports`.
+
+---
+
+### 5. Retry-Safety & Idempotency Strategy
+
+#### What Could Happen During a Mid-Execution Crash?
+If a worker process crashes (e.g. timeout, container restart, process kill) immediately after inserting a contact for row $N$, but before updating `processed_rows` in the database, the database contains the created contact while `processed_rows` remains at $N-1$. When Laravel retries the queued job, re-processing row $N$ without idempotency protections would call `CreateContact` again, creating **duplicate contacts**.
+
+#### How Our Solution Prevents Duplicates
+1. **Atomic DB Transactions per Chunk**: Each ~50-row chunk execution and its corresponding `import_jobs` progress counter update are wrapped inside a single atomic database transaction (`DB::transaction`). If a crash occurs mid-chunk, all uncommitted contact insertions roll back together with the progress counter, keeping database state perfectly synchronized.
+2. **Row-Level Idempotency Check**: Before calling `(new CreateContact)->execute()`, the job queries the target vault (`Contact::where('vault_id', $vaultId)->where(...)`) to check if a contact matching the row identity (`first_name`, `last_name`, `nickname`) already exists. If found, creation is safely skipped and counted as successful, making queue retries completely idempotent.
+
+---
+
+### 6. Technical Questions & Answers
+
+#### Q1: What could happen if the job crashes after creating a contact but before updating the progress counter?
+> **Answer**: Without idempotency protections, the created contact would exist in the database while `processed_rows` would reflect the previous state. When Laravel retries the job from the last recorded position, re-evaluating the row would create duplicate contact records.
+
+#### Q2: How does your solution reduce or prevent duplicate processing?
+> **Answer**: We combine **Atomic DB Transactions per Chunk** (ensuring contact creation and counter updates commit together) with **Row-Level Idempotency Lookups** (checking the target vault for pre-existing contacts matching the row attributes before executing `CreateContact`).
+
+#### Q3: Why store row-level errors in a JSON column vs an `import_errors` table?
+> **Answer**: Storing row-level errors directly as a structured JSON column (`errors`) on the `import_jobs` table avoids N+1 database INSERT operations during batch execution and eliminates multi-table `JOIN` overhead when clients poll `/api/import` progress, allowing the API to fetch status, progress metrics, and error details in a single fast query.
+
+---
+
+### 7. Automated Test Instructions
+
+All automated tests covering Import Initiation, Progress Tracking, Per-Row Error Isolation, Retry Safety, Import Cancellation, and Downloadable Failed Rows can be executed via a single command:
+
+#### Run All Import Tests (Docker Sail / WSL):
 ```bash
-# Using Sail (Docker / WSL):
 ./vendor/bin/sail test --filter=Import
+```
 
-# Or using native PHP / Artisan:
+#### Run Specific Test Classes:
+- **API Feature Tests**:
+  ```bash
+  ./vendor/bin/sail test tests/Feature/Api/ImportControllerTest.php
+  ```
+- **Background Job Unit Tests**:
+  ```bash
+  ./vendor/bin/sail test tests/Unit/Jobs/ImportContactsFromCsvJobTest.php
+  ```
+
+#### Native PHP / Artisan Alternative:
+```bash
 php artisan test --filter=Import
 ```
 
@@ -197,4 +308,5 @@ php artisan test --filter=Import
 Copyright © 2016–2023
 
 Licensed under [the AGPL License](/LICENSE.md).
+
 

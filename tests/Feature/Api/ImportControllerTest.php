@@ -47,7 +47,11 @@ class ImportControllerTest extends TestCase
         $account = Account::factory()->create();
         $user = User::factory()->create(['account_id' => $account->id]);
         $vault = Vault::factory()->create(['account_id' => $account->id]);
-        $user->vaults()->attach($vault->id, ['permission' => 1]);
+        $userContact = Contact::factory()->create(['vault_id' => $vault->id]);
+        $user->vaults()->attach($vault->id, [
+            'permission' => 1,
+            'contact_id' => $userContact->id,
+        ]);
 
         Sanctum::actingAs($user, ['*']);
 
@@ -202,6 +206,33 @@ class ImportControllerTest extends TestCase
         ]);
     }
 
+    public function test_cannot_cancel_already_completed_import(): void
+    {
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'filename' => 'contacts.csv',
+            'file_path' => 'imports/contacts.csv',
+            'status' => ImportJob::STATUS_COMPLETED,
+            'total_rows' => 10,
+            'processed_rows' => 10,
+            'successful_rows' => 10,
+            'failed_rows' => 0,
+        ]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $response = $this->postJson("/api/import/{$import->id}/cancel");
+
+        $response->assertStatus(422)
+            ->assertJson([
+                'message' => "Cannot cancel an import that has already reached state 'completed'.",
+            ]);
+    }
+
     public function test_download_failed_rows_returns_csv_of_rejected_rows(): void
     {
         Storage::fake('local');
@@ -243,5 +274,33 @@ class ImportControllerTest extends TestCase
         $this->assertStringContainsString('row_number,error_reason,first_name,last_name,email', $content);
         $this->assertStringContainsString('3,Missing required name', $content);
         $this->assertStringContainsString('invalid-email', $content);
+    }
+
+    public function test_download_failed_rows_returns_404_when_no_failed_rows_exist(): void
+    {
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'filename' => 'successful_import.csv',
+            'file_path' => 'imports/successful.csv',
+            'status' => ImportJob::STATUS_COMPLETED,
+            'total_rows' => 5,
+            'processed_rows' => 5,
+            'successful_rows' => 5,
+            'failed_rows' => 0,
+            'errors' => [],
+        ]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $response = $this->getJson("/api/import/{$import->id}/failed-rows");
+
+        $response->assertStatus(404)
+            ->assertJson([
+                'message' => 'No failed rows exist for this import job.',
+            ]);
     }
 }

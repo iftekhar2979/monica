@@ -34,7 +34,11 @@ class ImportContactsFromCsvJob implements ShouldQueue
             return;
         }
 
-        // 1. Transition status from pending to processing
+        // 1. Transition status from pending to processing (if not cancelled)
+        if ($import->status === ImportJob::STATUS_CANCELLED) {
+            return;
+        }
+
         $import->update([
             'status' => ImportJob::STATUS_PROCESSING,
             'started_at' => Carbon::now(),

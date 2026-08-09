@@ -23,13 +23,17 @@ class ImportContactsFromCsvJobTest extends TestCase
         $account = Account::factory()->create();
         $user = User::factory()->create(['account_id' => $account->id]);
         $vault = Vault::factory()->create(['account_id' => $account->id]);
-        $user->vaults()->attach($vault->id, ['permission' => 1]);
+        $userContact = Contact::factory()->create(['vault_id' => $vault->id]);
+        $user->vaults()->attach($vault->id, [
+            'permission' => 1,
+            'contact_id' => $userContact->id,
+        ]);
 
         $csvLines = [
             "first_name,last_name,email",
             "Alice,Smith,alice@example.com",
             "Bob,Jones,invalid-email-address", // Invalid email
-            ",,",                              // Missing name
+            ",,bad-email-2",                    // Missing name & invalid email
             "Charlie,Brown,charlie@example.com",
         ];
 
@@ -124,7 +128,11 @@ class ImportContactsFromCsvJobTest extends TestCase
         $account = Account::factory()->create();
         $user = User::factory()->create(['account_id' => $account->id]);
         $vault = Vault::factory()->create(['account_id' => $account->id]);
-        $user->vaults()->attach($vault->id, ['permission' => 1]);
+        $userContact = Contact::factory()->create(['vault_id' => $vault->id]);
+        $user->vaults()->attach($vault->id, [
+            'permission' => 1,
+            'contact_id' => $userContact->id,
+        ]);
 
         $csvLines = [
             "first_name,last_name",
@@ -152,8 +160,9 @@ class ImportContactsFromCsvJobTest extends TestCase
         $job1 = new ImportContactsFromCsvJob($import);
         $job1->handle();
 
+        // 2 new contacts + 1 userContact created
         $initialContactCount = Contact::where('vault_id', $vault->id)->count();
-        $this->assertEquals(2, $initialContactCount);
+        $this->assertEquals(3, $initialContactCount);
 
         // Simulate Laravel queue retry after timeout/worker restart
         $job2 = new ImportContactsFromCsvJob($import);
@@ -161,7 +170,7 @@ class ImportContactsFromCsvJobTest extends TestCase
 
         // Assert that retry did NOT create duplicate contacts
         $retryContactCount = Contact::where('vault_id', $vault->id)->count();
-        $this->assertEquals(2, $retryContactCount);
+        $this->assertEquals(3, $retryContactCount);
     }
 
     public function test_job_aborts_immediately_when_status_is_cancelled(): void
@@ -171,7 +180,11 @@ class ImportContactsFromCsvJobTest extends TestCase
         $account = Account::factory()->create();
         $user = User::factory()->create(['account_id' => $account->id]);
         $vault = Vault::factory()->create(['account_id' => $account->id]);
-        $user->vaults()->attach($vault->id, ['permission' => 1]);
+        $userContact = Contact::factory()->create(['vault_id' => $vault->id]);
+        $user->vaults()->attach($vault->id, [
+            'permission' => 1,
+            'contact_id' => $userContact->id,
+        ]);
 
         $csvLines = [
             "first_name,last_name",
@@ -201,8 +214,8 @@ class ImportContactsFromCsvJobTest extends TestCase
 
         $import->refresh();
 
-        // Assert status remains CANCELLED and no contacts were created
+        // Assert status remains CANCELLED and no new contacts were created
         $this->assertEquals(ImportJob::STATUS_CANCELLED, $import->status);
-        $this->assertEquals(0, Contact::where('vault_id', $vault->id)->count());
+        $this->assertEquals(1, Contact::where('vault_id', $vault->id)->count());
     }
 }

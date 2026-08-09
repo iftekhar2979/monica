@@ -69,7 +69,7 @@ If a worker process crashes (e.g. timeout, container restart, worker crash) righ
 
 ### 8. Automated Testing Instructions
 
-All automated tests covering Import Initiation, Progress Tracking, Per-Row Error Isolation, Retry Safety, Import Cancellation, and Downloadable Failed Rows can be executed via a single command:
+Run the automated test suite covering Import Initiation, Progress Tracking, Per-Row Error Isolation, Retry Safety, Import Cancellation, and Downloadable Failed Rows:
 
 #### Using Laravel Sail (Docker/WSL):
 

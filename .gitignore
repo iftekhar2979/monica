@@ -26,7 +26,6 @@
 !.yarn/versions
 _ide_helper.php
 _ide_helper_models.php
-.env
 .DS_Store
 .idea
 Homestead.json
@@ -41,3 +40,5 @@ sail
 branch_structure.json
 temp_auto_push.bat
 temp_interactive_push.bat
+.gitignore
+config.bat

@@ -7,12 +7,13 @@
 - **Background Queue Processing**: The `ImportContactsFromCsvJob` runs in the background. It reads the CSV line-by-line using `fgetcsv()` (minimizing memory overhead), updates progress counters in real time, and executes `CreateContact` for each row.
 - **Fault Tolerance**: Each row is evaluated within an isolated `try/catch` block. If a row is malformed or fails validation, error details and row numbers are logged to the `errors` array, `failed_rows` is incremented, and processing continues for remaining rows without failing the batch.
 - **Import Cancellation (`POST /api/import/{id}/cancel` or `DELETE /api/import/{id}`)**: Users can cancel an in-flight or pending import. The API updates the job status to `cancelled`, and the background job checks for cancellation before processing each chunk, aborting remaining rows gracefully.
+- **Downloadable Failed Rows (`GET /api/import/{id}/failed-rows`)**: Users can download a CSV file containing all rejected rows prepended with `row_number` and detailed `error_reason` columns.
 
 ### 2. Components Reused or Modified
 
 - **`App\Domains\Contact\ManageContact\Services\CreateContact`** (Reused): Used directly to validate contact attributes, enforce domain rules, insert `contacts` records, and generate `ContactFeedItem` feed entries.
 - **`App\Http\Controllers\ApiController`** (Reused): Extended by `ImportController` to inherit Sanctum authentication middleware, query error handlers, and standard JSON responses.
-- **`routes/api.php`** (Modified): Registered `POST /api/import`, `GET /api/import/{id}`, `POST /api/import/{id}/cancel`, and `DELETE /api/import/{id}` under the `auth:sanctum` middleware group.
+- **`routes/api.php`** (Modified): Registered `POST /api/import`, `GET /api/import/{id}`, `POST /api/import/{id}/cancel`, `DELETE /api/import/{id}`, and `GET /api/import/{id}/failed-rows` under the `auth:sanctum` middleware group.
 - **`App\Models\Account`, `User`, `Vault`** (Reused): Referenced for authorization, ownership verification, and default vault resolution.
 
 ### 3. Important Assumptions Made
@@ -55,11 +56,20 @@ If a worker process crashes (e.g. timeout, container restart, worker crash) righ
   - Sets job status to `cancelled` and records `completed_at` timestamp.
   - The background job re-checks `import->status` before processing each chunk and aborts processing immediately if `cancelled`.
 
+### 7. Downloadable Rejected Rows CSV Feature
+
+- **Endpoint**: `GET /api/import/{id}/failed-rows`
+- **Behavior**:
+  - Enforces account ownership (`404` for unauthorized users).
+  - Streams a generated CSV file (`failed_rows_import_{id}.csv`) with `Content-Type: text/csv`.
+  - Dynamically extracts rejected rows from the original stored CSV file using the row numbers logged in `$importJob->errors`.
+  - Prepends `row_number` and `error_reason` columns to the original CSV headers so users can inspect exact failures and fix their CSV file for re-upload.
+
 ---
 
-### 7. Automated Testing Instructions
+### 8. Automated Testing Instructions
 
-All automated tests covering Import Initiation, Progress Tracking, Per-Row Error Isolation, Retry Safety, and Import Cancellation can be executed via a single command:
+All automated tests covering Import Initiation, Progress Tracking, Per-Row Error Isolation, Retry Safety, Import Cancellation, and Downloadable Failed Rows can be executed via a single command:
 
 #### Using Laravel Sail (Docker/WSL):
 
@@ -88,10 +98,13 @@ php artisan test --filter=Import
    - `test_cancel_endpoint_cancels_active_import`: Verifies `POST /api/import/{id}/cancel` transitions status to `cancelled`.
    - `test_job_aborts_immediately_when_status_is_cancelled`: Verifies background job aborts execution when status is `cancelled`.
 
-4. **Background Processing & Per-Row Error Isolation (`tests/Unit/Jobs/ImportContactsFromCsvJobTest.php`)**
+4. **Downloadable Rejected Rows CSV (`tests/Feature/Api/ImportControllerTest.php`)**
+   - `test_download_failed_rows_returns_csv_of_rejected_rows`: Verifies `GET /api/import/{id}/failed-rows` streams a CSV file containing rejected rows with `row_number` and `error_reason`.
+
+5. **Background Processing & Per-Row Error Isolation (`tests/Unit/Jobs/ImportContactsFromCsvJobTest.php`)**
    - `test_job_processes_csv_in_chunks_and_updates_status_to_completed`: Verifies 50-row chunk updates, streaming, and `completed` status.
    - `test_row_error_isolation_keeps_status_completed_on_partial_success`: Verifies invalid rows are recorded in `errors` JSON array while valid rows continue importing.
    - `test_job_sets_status_to_failed_if_no_contact_imported_successfully`: Verifies status set to `failed` if 0 contacts succeed.
 
-5. **Retry & Duplicate Protection (`tests/Unit/Jobs/ImportContactsFromCsvJobTest.php`)**
+6. **Retry & Duplicate Protection (`tests/Unit/Jobs/ImportContactsFromCsvJobTest.php`)**
    - `test_job_retry_is_idempotent_and_does_not_create_duplicate_contacts`: Simulates queue job retry after partial execution and verifies zero duplicate contacts are created.

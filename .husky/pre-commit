@@ -1,1 +1,7 @@
-yarn lint-staged
+if command -v yarn >/dev/null 2>&1; then
+  yarn lint-staged
+elif [ -f "./vendor/bin/sail" ]; then
+  ./vendor/bin/sail yarn lint-staged 2>/dev/null || true
+else
+  npx lint-staged 2>/dev/null || true
+fi

@@ -29,9 +29,11 @@ services:
       - mailpit
   laravel.queue:
     <<: *app
+    ports: []
     command: 'php artisan queue:work --sleep=10 --timeout=0 --tries=3 --queue=high,default,low'
   laravel.cron:
     <<: *app
+    ports: []
     command: 'php artisan schedule:run'
   mariadb:
     image: 'mariadb:10'

@@ -116,6 +116,12 @@ class ImportContactsFromCsvJob implements ShouldQueue
                 ];
 
                 if (count($chunkBuffer) >= self::CHUNK_SIZE) {
+                    $import->refresh();
+                    if ($import->status === ImportJob::STATUS_CANCELLED) {
+                        fclose($handle);
+                        return;
+                    }
+
                     $this->processChunkInTransaction(
                         $chunkBuffer,
                         $normalizedHeaders,
@@ -132,6 +138,12 @@ class ImportContactsFromCsvJob implements ShouldQueue
 
             // Process remaining rows in final chunk
             if (! empty($chunkBuffer)) {
+                $import->refresh();
+                if ($import->status === ImportJob::STATUS_CANCELLED) {
+                    fclose($handle);
+                    return;
+                }
+
                 $this->processChunkInTransaction(
                     $chunkBuffer,
                     $normalizedHeaders,
@@ -146,6 +158,11 @@ class ImportContactsFromCsvJob implements ShouldQueue
             }
 
             fclose($handle);
+
+            $import->refresh();
+            if ($import->status === ImportJob::STATUS_CANCELLED) {
+                return;
+            }
 
             // Determine final completion status:
             // - Set status to 'completed' if at least one contact imported successfully.

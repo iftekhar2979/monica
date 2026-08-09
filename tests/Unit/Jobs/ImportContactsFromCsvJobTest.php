@@ -163,4 +163,46 @@ class ImportContactsFromCsvJobTest extends TestCase
         $retryContactCount = Contact::where('vault_id', $vault->id)->count();
         $this->assertEquals(2, $retryContactCount);
     }
+
+    public function test_job_aborts_immediately_when_status_is_cancelled(): void
+    {
+        Storage::fake('local');
+
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+        $vault = Vault::factory()->create(['account_id' => $account->id]);
+        $user->vaults()->attach($vault->id, ['permission' => 1]);
+
+        $csvLines = [
+            "first_name,last_name",
+            "Frank,Wright",
+            "Grace,Hopper",
+        ];
+
+        $filePath = 'imports/cancel_test.csv';
+        Storage::put($filePath, implode("\n", $csvLines));
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'vault_id' => $vault->id,
+            'filename' => 'cancel_test.csv',
+            'file_path' => $filePath,
+            'status' => ImportJob::STATUS_CANCELLED, // Set status to CANCELLED prior to job run
+            'failure_message' => 'Import was cancelled by user.',
+            'total_rows' => 0,
+            'processed_rows' => 0,
+            'successful_rows' => 0,
+            'failed_rows' => 0,
+        ]);
+
+        $job = new ImportContactsFromCsvJob($import);
+        $job->handle();
+
+        $import->refresh();
+
+        // Assert status remains CANCELLED and no contacts were created
+        $this->assertEquals(ImportJob::STATUS_CANCELLED, $import->status);
+        $this->assertEquals(0, Contact::where('vault_id', $vault->id)->count());
+    }
 }

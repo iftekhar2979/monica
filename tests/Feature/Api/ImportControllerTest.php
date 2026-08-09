@@ -165,4 +165,40 @@ class ImportControllerTest extends TestCase
 
         $response->assertStatus(404);
     }
+
+    public function test_cancel_endpoint_cancels_active_import(): void
+    {
+        $account = Account::factory()->create();
+        $user = User::factory()->create(['account_id' => $account->id]);
+
+        $import = ImportJob::create([
+            'account_id' => $account->id,
+            'user_id' => $user->id,
+            'filename' => 'contacts.csv',
+            'file_path' => 'imports/contacts.csv',
+            'status' => ImportJob::STATUS_PROCESSING,
+            'total_rows' => 100,
+            'processed_rows' => 20,
+            'successful_rows' => 20,
+            'failed_rows' => 0,
+        ]);
+
+        Sanctum::actingAs($user, ['*']);
+
+        $response = $this->postJson("/api/import/{$import->id}/cancel");
+
+        $response->assertStatus(200)
+            ->assertJson([
+                'data' => [
+                    'id' => $import->id,
+                    'status' => 'cancelled',
+                ],
+            ]);
+
+        $this->assertDatabaseHas('import_jobs', [
+            'id' => $import->id,
+            'status' => ImportJob::STATUS_CANCELLED,
+            'failure_message' => 'Import was cancelled by user.',
+        ]);
+    }
 }

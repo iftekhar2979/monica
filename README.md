@@ -198,9 +198,14 @@ Monica makes use of numerous open-source projects and we are deeply grateful. We
 ### 4. Data Model Design Decisions (`import_jobs` Table)
 * **Table & Model Naming (`import_jobs` / `ImportJob`)**: Created `import_jobs` table and `App\Models\ImportJob` model to follow Monica's standard Laravel table naming conventions.
 * **Account & User Scoping (`account_id`, `user_id`)**: Includes `account_id` foreign key for strict multi-tenant account isolation, `user_id` to track the initiating user, and `vault_id` for target vault scoping.
-* **Dual Error Tracking (`failure_message` & `errors`)**:
-  * **`failure_message`** (text, nullable): Records high-level system failures (e.g. unreadable file, empty file stream, catastrophic job error).
-  * **`errors`** (JSON, nullable): Stores line-by-line validation/execution failures (`[ { "row": 3, "errors": [...] } ]`) so users can inspect exact row errors.
+* **Dual Error Tracking & Storage Justification (`failure_message` & `errors`)**:
+  * **`failure_message`** (text, nullable): Records high-level system failures (e.g. unreadable file, empty file stream, zero successful imports).
+  * **`errors`** (JSON, nullable): Stores line-by-line validation/execution failures (`[ { "row": 3, "errors": ["Invalid email format"] } ]`).
+  * **Justification**: Storing row-level errors directly as a structured JSON column on `import_jobs` rather than a separate table avoids N+1 insert operations during background processing and eliminates multi-table JOIN overhead when clients poll `/api/import` progress.
+* **Completion Status Rules**:
+  * If **at least one** contact is created successfully (`successful_rows > 0`), the import completes with status `completed` (even if some rows failed).
+  * If **no contact** is imported successfully (`successful_rows === 0` and `total_rows > 0`), the overall status is set to `failed` with a descriptive `failure_message`.
+
 * **Progress Counters (`total_rows`, `processed_rows`, `successful_rows`, `failed_rows`)**: Stores real-time integers for progress monitoring and progress bar percentages.
 * **Timestamps (`started_at`, `completed_at`)**: Tracks execution start time and completion duration alongside standard `created_at` and `updated_at` fields.
 

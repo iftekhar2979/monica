@@ -13,10 +13,13 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
+use Throwable;
 
 class ImportContactsFromCsvJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    public const CHUNK_SIZE = 50;
 
     public function __construct(
         public ImportJob $import
@@ -29,87 +32,172 @@ class ImportContactsFromCsvJob implements ShouldQueue
             return;
         }
 
+        // 1. Transition status from pending to processing
         $import->update([
             'status' => ImportJob::STATUS_PROCESSING,
             'started_at' => Carbon::now(),
         ]);
 
-        $filePath = Storage::path($import->file_path);
-        if (! file_exists($filePath)) {
-            $import->update([
-                'status' => ImportJob::STATUS_FAILED,
-                'failure_message' => 'File not found in storage location: ' . $import->file_path,
-                'errors' => [['row' => 0, 'errors' => ['File not found in storage location.']]],
-                'completed_at' => Carbon::now(),
-            ]);
+        try {
+            $filePath = Storage::path($import->file_path);
+            if (! file_exists($filePath)) {
+                $import->update([
+                    'status' => ImportJob::STATUS_FAILED,
+                    'failure_message' => 'System error: File not found in storage location (' . $import->file_path . ').',
+                    'completed_at' => Carbon::now(),
+                ]);
 
-            return;
-        }
+                return;
+            }
 
-        $handle = fopen($filePath, 'r');
-        if (! $handle) {
-            $import->update([
-                'status' => ImportJob::STATUS_FAILED,
-                'failure_message' => 'Unable to open CSV file at ' . $filePath,
-                'errors' => [['row' => 0, 'errors' => ['Unable to open CSV file.']]],
-                'completed_at' => Carbon::now(),
-            ]);
+            // 2. Read CSV incrementally using stream handle
+            $handle = fopen($filePath, 'r');
+            if (! $handle) {
+                $import->update([
+                    'status' => ImportJob::STATUS_FAILED,
+                    'failure_message' => 'System error: Unable to open CSV file stream.',
+                    'completed_at' => Carbon::now(),
+                ]);
 
-            return;
-        }
+                return;
+            }
 
-        // Read headers
-        $headers = fgetcsv($handle);
-        if (! $headers) {
+            // Read header row
+            $headers = fgetcsv($handle);
+            if (! $headers) {
+                fclose($handle);
+                $import->update([
+                    'status' => ImportJob::STATUS_FAILED,
+                    'failure_message' => 'System error: CSV file is empty or missing headers.',
+                    'completed_at' => Carbon::now(),
+                ]);
+
+                return;
+            }
+
+            // Clean & normalize headers
+            $normalizedHeaders = array_map(function ($header) {
+                return strtolower(trim(preg_replace('/[\x00-\x1F\x7F-\xFF]/', '', $header)));
+            }, $headers);
+
+            // Count total data rows incrementally
+            $totalRows = 0;
+            while (fgets($handle) !== false) {
+                $totalRows++;
+            }
+            rewind($handle);
+            fgetcsv($handle); // Skip header row again
+
+            $import->update(['total_rows' => $totalRows]);
+
+            $processedRows = 0;
+            $successfulRows = 0;
+            $failedRows = 0;
+            $errors = [];
+
+            // Resolve target vault
+            $vaultId = $import->vault_id;
+            if (! $vaultId) {
+                $defaultVault = $import->user->vaults()->first();
+                $vaultId = $defaultVault?->id;
+            }
+
+            $rowNumber = 1; // Row 1 is header
+            $chunkBuffer = [];
+
+            // 3. Process rows in chunks of ~50
+            while (($row = fgetcsv($handle)) !== false) {
+                $rowNumber++;
+                $chunkBuffer[] = [
+                    'row_number' => $rowNumber,
+                    'data' => $row,
+                ];
+
+                if (count($chunkBuffer) >= self::CHUNK_SIZE) {
+                    $this->processChunk(
+                        $chunkBuffer,
+                        $normalizedHeaders,
+                        $import,
+                        $vaultId,
+                        $processedRows,
+                        $successfulRows,
+                        $failedRows,
+                        $errors
+                    );
+                    $chunkBuffer = []; // Reset buffer for next chunk
+                }
+            }
+
+            // Process any remaining rows in final chunk
+            if (! empty($chunkBuffer)) {
+                $this->processChunk(
+                    $chunkBuffer,
+                    $normalizedHeaders,
+                    $import,
+                    $vaultId,
+                    $processedRows,
+                    $successfulRows,
+                    $failedRows,
+                    $errors
+                );
+                $chunkBuffer = [];
+            }
+
             fclose($handle);
+
+            // Determine final completion status:
+            // - Set status to 'completed' if at least one contact imported successfully.
+            // - Set overall status to 'failed' if NO contact was imported successfully.
+            $finalStatus = ImportJob::STATUS_COMPLETED;
+            $failureMessage = null;
+
+            if ($successfulRows === 0 && $totalRows > 0) {
+                $finalStatus = ImportJob::STATUS_FAILED;
+                $failureMessage = "Import failed: No contacts were imported successfully. All {$processedRows} rows had validation or contact creation errors.";
+            }
+
             $import->update([
-                'status' => ImportJob::STATUS_FAILED,
-                'failure_message' => 'CSV file is empty or missing headers.',
-                'errors' => [['row' => 0, 'errors' => ['CSV file is empty or missing headers.']]],
+                'status' => $finalStatus,
+                'failure_message' => $failureMessage,
+                'processed_rows' => $processedRows,
+                'successful_rows' => $successfulRows,
+                'failed_rows' => $failedRows,
+                'errors' => $errors,
                 'completed_at' => Carbon::now(),
             ]);
-
-            return;
+        } catch (Throwable $e) {
+            // System-level error handling
+            $import->update([
+                'status' => ImportJob::STATUS_FAILED,
+                'failure_message' => 'System-level error during processing: ' . $e->getMessage(),
+                'completed_at' => Carbon::now(),
+            ]);
         }
+    }
 
-        // Clean headers (trim whitespace, lowercase)
-        $normalizedHeaders = array_map(function ($header) {
-            return strtolower(trim(preg_replace('/[\x00-\x1F\x7F-\xFF]/', '', $header)));
-        }, $headers);
-
-        // Count total rows
-        $totalRows = 0;
-        while (fgets($handle) !== false) {
-            $totalRows++;
-        }
-        rewind($handle);
-        fgetcsv($handle); // Skip header row again
-
-        $import->update(['total_rows' => $totalRows]);
-
-        $processedRows = 0;
-        $successfulRows = 0;
-        $failedRows = 0;
-        $errors = [];
-
-        // Ensure default vault if vault_id is null
-        $vaultId = $import->vault_id;
-        if (! $vaultId) {
-            $defaultVault = $import->user->vaults()->first();
-            $vaultId = $defaultVault?->id;
-        }
-
-        $rowNumber = 1; // Row 1 was header
-        while (($row = fgetcsv($handle)) !== false) {
-            $rowNumber++;
+    /**
+     * Process a chunk of ~50 rows and update database counters after each chunk.
+     */
+    private function processChunk(
+        array $chunkBuffer,
+        array $normalizedHeaders,
+        ImportJob $import,
+        ?string $vaultId,
+        int &$processedRows,
+        int &$successfulRows,
+        int &$failedRows,
+        array &$errors
+    ): void {
+        foreach ($chunkBuffer as $item) {
+            $rowNumber = $item['row_number'];
+            $row = $item['data'];
             $processedRows++;
 
-            // Skip empty rows
+            // Skip completely empty rows
             if (empty(array_filter($row))) {
                 continue;
             }
 
-            // Combine headers with row values
             $rowLength = count($row);
             $headerLength = count($normalizedHeaders);
 
@@ -121,7 +209,6 @@ class ImportContactsFromCsvJob implements ShouldQueue
 
             $rowData = array_combine($normalizedHeaders, $row);
 
-            // Extract contact fields
             $firstName = trim($rowData['first_name'] ?? $rowData['firstname'] ?? $rowData['first name'] ?? '');
             $lastName = trim($rowData['last_name'] ?? $rowData['lastname'] ?? $rowData['last name'] ?? '');
             $middleName = trim($rowData['middle_name'] ?? $rowData['middlename'] ?? '');
@@ -129,20 +216,26 @@ class ImportContactsFromCsvJob implements ShouldQueue
             $maidenName = trim($rowData['maiden_name'] ?? $rowData['maidenname'] ?? '');
             $prefix = trim($rowData['prefix'] ?? '');
             $suffix = trim($rowData['suffix'] ?? '');
+            $email = trim($rowData['email'] ?? $rowData['email_address'] ?? $rowData['email address'] ?? '');
 
-            // Basic row validation check: at least first_name, last_name, or nickname must be present
+            // Validation Rule 1: Missing required name (at least first_name, last_name, or nickname)
             if (empty($firstName) && empty($lastName) && empty($nickname)) {
                 $failedRows++;
                 $errors[] = [
                     'row' => $rowNumber,
-                    'errors' => ['At least one of first_name, last_name, or nickname is required.'],
+                    'errors' => ['Missing required name: At least one of first_name, last_name, or nickname is required.'],
                 ];
 
-                $import->update([
-                    'processed_rows' => $processedRows,
-                    'failed_rows' => $failedRows,
-                    'errors' => $errors,
-                ]);
+                continue;
+            }
+
+            // Validation Rule 2: Invalid email format
+            if (! empty($email) && ! filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $failedRows++;
+                $errors[] = [
+                    'row' => $rowNumber,
+                    'errors' => ["Invalid email format: '{$email}' is not a valid email address."],
+                ];
 
                 continue;
             }
@@ -162,13 +255,14 @@ class ImportContactsFromCsvJob implements ShouldQueue
                     'listed' => true,
                 ];
 
+                // Create contact through Monica's existing CreateContact service
                 (new CreateContact)->execute($serviceData);
                 $successfulRows++;
             } catch (ValidationException $e) {
                 $failedRows++;
                 $errors[] = [
                     'row' => $rowNumber,
-                    'errors' => array_values($e->errors()),
+                    'errors' => array_merge(...array_values($e->errors())),
                 ];
             } catch (Exception $e) {
                 $failedRows++;
@@ -177,25 +271,14 @@ class ImportContactsFromCsvJob implements ShouldQueue
                     'errors' => [$e->getMessage()],
                 ];
             }
-
-            // Periodically update progress
-            $import->update([
-                'processed_rows' => $processedRows,
-                'successful_rows' => $successfulRows,
-                'failed_rows' => $failedRows,
-                'errors' => $errors,
-            ]);
         }
 
-        fclose($handle);
-
+        // Update database progress after each chunk
         $import->update([
-            'status' => ImportJob::STATUS_COMPLETED,
             'processed_rows' => $processedRows,
             'successful_rows' => $successfulRows,
             'failed_rows' => $failedRows,
             'errors' => $errors,
-            'completed_at' => Carbon::now(),
         ]);
     }
 }

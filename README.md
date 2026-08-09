@@ -177,8 +177,24 @@ We are also fortunate to have an amazing [community of developers](https://githu
 
 Monica makes use of numerous open-source projects and we are deeply grateful. We hope that by offering Monica as a free, open-source project, we can help others in the same way these programs have helped us.
 
+## Asynchronous CSV Import Architecture
+
+For full implementation details, see [TASK_DOCUMENTATION.md](file:///d:/pswrk/monica/TASK_DOCUMENTATION.md).
+
+### Automated Testing Instructions
+All automated tests covering Import Initiation, Progress Tracking, Per-Row Error Isolation, and Retry Safety can be executed via a single command:
+
+```bash
+# Using Sail (Docker / WSL):
+./vendor/bin/sail test --filter=Import
+
+# Or using native PHP / Artisan:
+php artisan test --filter=Import
+```
+
 ## License
 
 Copyright © 2016–2023
 
 Licensed under [the AGPL License](/LICENSE.md).
+
